@@ -193,33 +193,38 @@ module Kitchen
           end
         end
 
-        # See https://github.com/aws/aws-sdk-ruby/issues/859
-        # Tagging can fail with a NotFound error even though we waited until the server exists
-        # Waiting can also fail, so we have to also retry on that.  If it means we re-tag the
-        # instance, so be it.
-        # Tagging an instance is possible before volumes are attached. Tagging the volumes after
-        # instance creation is consistent.
-        Retryable.retryable(
-          :tries => 10,
-          :sleep => lambda { |n| [2**n, 30].min },
-          :on => ::Aws::EC2::Errors::InvalidInstanceIDNotFound
-        ) do |r, _|
-          info("Attempting to tag the instance, #{r} retries")
-          tag_server(server)
+        # We only need to tag the server and volumes if it is a spot instance.  On-demand
+        # instances are tagged atomicly, when the instance is launched.  AWS does not (yet)
+        # support atomic tagging with spot instances.
+        if config[:spot_price]
+          # See https://github.com/aws/aws-sdk-ruby/issues/859
+          # Tagging can fail with a NotFound error even though we waited until the server exists
+          # Waiting can also fail, so we have to also retry on that.  If it means we re-tag the
+          # instance, so be it.
+          # Tagging an instance is possible before volumes are attached. Tagging the volumes after
+          # instance creation is consistent.
+          Retryable.retryable(
+            :tries => 10,
+            :sleep => lambda { |n| [2**n, 30].min },
+            :on => ::Aws::EC2::Errors::InvalidInstanceIDNotFound
+          ) do |r, _|
+            info("Attempting to tag the instance, #{r} retries")
+            tag_server(server)
 
-          # Get information about the AMI (image) used to create the image.
-          image_data = ec2.client.describe_images({ :image_ids => [server.image_id] })[0][0]
+            # Get information about the AMI (image) used to create the image.
+            image_data = ec2.client.describe_images({ :image_ids => [server.image_id] })[0][0]
 
-          state[:server_id] = server.id
-          info("EC2 instance <#{state[:server_id]}> created.")
+            state[:server_id] = server.id
+            info("EC2 instance <#{state[:server_id]}> created.")
 
-          # instance-store backed images do not have attached volumes, so only
-          # wait for the volumes to be ready if the instance EBS-backed.
-          if image_data.root_device_type == "ebs"
-            wait_until_volumes_ready(server, state)
-            tag_volumes(server)
+            # instance-store backed images do not have attached volumes, so only
+            # wait for the volumes to be ready if the instance EBS-backed.
+            if image_data.root_device_type == "ebs"
+              wait_until_volumes_ready(server, state)
+              tag_volumes(server)
+            end
+            wait_until_ready(server, state)
           end
-          wait_until_ready(server, state)
         end
 
         if windows_os? &&
@@ -351,6 +356,12 @@ module Kitchen
         end
         instance_data[:min_count] = 1
         instance_data[:max_count] = 1
+        if config[:tags] && !config[:tags].empty?
+          tags = config[:tags].map do |k, v|
+            { :key => k, :value => v }
+          end
+          instance_data[:tag_specifications] = tags
+        end
         ec2.create_instance(instance_data)
       end
 
